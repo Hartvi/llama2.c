@@ -58,6 +58,7 @@ multiple_of = 32
 dropout = 0.0
 # adamw optimizer
 gradient_accumulation_steps = 4  # used to simulate larger batch sizes
+# TODO: small model larger LR
 learning_rate = 5e-4  # max learning rate
 max_iters = 100000  # total number of training iterations
 weight_decay = 1e-1
@@ -68,7 +69,7 @@ grad_clip = 1.0  # clip gradients at this value, or disable if == 0.0
 decay_lr = True  # whether to decay the learning rate
 warmup_iters = 1000  # how many steps to warm up for
 # system
-device = "cuda"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+device = "cpu"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = "bfloat16"  # float32|bfloat16|float16
 compile = True  # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
@@ -183,6 +184,8 @@ elif init_from == "resume":
     iter_num = checkpoint["iter_num"]
     best_val_loss = checkpoint["best_val_loss"]
 model.to(device)
+assert model
+model: Transformer
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
@@ -219,7 +222,7 @@ def estimate_loss():
             X, Y = next(batch_iter)
             with ctx:
                 logits = model(X, Y)
-                loss = raw_model.last_loss
+                loss = raw_model.primary_loss
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()

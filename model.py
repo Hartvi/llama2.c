@@ -22,6 +22,7 @@ class ModelArgs:
     norm_eps: float = 1e-5
     max_seq_len: int = 2048
     dropout: float = 0.0
+    n_outputs: int = 3
 
 
 class RMSNorm(torch.nn.Module):
@@ -208,6 +209,7 @@ class Transformer(nn.Module):
 
     def __init__(self, params: ModelArgs):
         super().__init__()
+        self.n_outputs = params.n_outputs
         self.params = params
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
@@ -219,6 +221,7 @@ class Transformer(nn.Module):
             self.layers.append(TransformerBlock(layer_id, params))
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
+        self.extra_outputs = [nn.Linear(params.dim, params.vocab_size, bias=False) for _ in range(self.n_outputs - 1)]
 
         # share the unembedding parameters with the embedding parameters
         self.tok_embeddings.weight = self.output.weight # https://paperswithcode.com/method/weight-tying
@@ -248,6 +251,10 @@ class Transformer(nn.Module):
 
     def forward(self, tokens: torch.Tensor, targets: Optional[torch.Tensor] = None) -> torch.Tensor:
         _bsz, seqlen = tokens.shape
+        seqlen = tokens.size(1) - self.n_outputs + 1
+        tokens = tokens[:, :seqlen]
+        # print("tokens:", tokens.size())
+        # print("targets:", targets.size())
         h = self.tok_embeddings(tokens)
         h = self.dropout(h)
         freqs_cos = self.freqs_cos[:seqlen]
@@ -256,15 +263,68 @@ class Transformer(nn.Module):
         for layer in self.layers:
             h = layer(h, freqs_cos, freqs_sin)
         h = self.norm(h)
+        print("h:", h.size())
 
+        """
+        multitoken prediction:
+        - have several targets to map to. N tokens to predict
+        - calculate cross entropy in a different way, perhaps on a per new token basis
+          - for that we need to somehow encode positions of the tokens as well
+        - make it run
+        """
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.output(h)
-            self.last_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-        else:
-            # inference-time mini-optimization: only forward the output on the very last position
-            logits = self.output(h[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            self.last_loss = None
+            print("logits:", logits.size())
+            # if self.n_outputs > 1:
+            #     extra_logits = [e(h) for e in self.extra_outputs]
+
+            # print("targets", targets.view(-1).size())
+            # print("logits original", logits.size())
+            # print("logits", logits.view(-1, logits.size(-1)).size())
+            # basically we want to shift the targets left for every new extra tokens we are generating
+            # logits: (n outputs, 512)
+            # self.last_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+
+            # print(targets[:, :seqlen].size())
+            # Calculate loss for the primary output
+            primary_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets[:, :seqlen].reshape(-1), ignore_index=-1)
+
+            # Calculate losses for extra outputs if we have multiple targets
+            if self.n_outputs > 1 and targets.size(1) > 1:  # seq_len = 512
+                extra_logits = [extra_output(h) for extra_output in self.extra_outputs]
+                extra_losses = []
+
+                for i, extra_logit in enumerate(extra_logits):
+                    # print("extra token range",  i + 1 , seqlen + i + 1)
+                    if seqlen + i + 1 <= targets.size(1):  # Check if we have a target for this output
+                        # print("extra logits original", extra_logit.size())
+                        # print("extra logits", extra_logit.view(-1, extra_logit.size(-1)).size())
+                        # print("target:", targets[:, i + 1 : seqlen + i + 1].size())
+                        # print("\n")
+                        loss = F.cross_entropy(
+                            extra_logit.view(-1, extra_logit.size(-1)),
+                            targets[:, i + 1 : seqlen + i + 1].reshape(-1),
+                            ignore_index=-1
+                        )
+                        extra_losses.append(loss)
+
+                if extra_losses:
+                    extra_weight = 0.5 / len(extra_losses) if extra_losses else 0
+                    self.last_loss = 0.5 * primary_loss + sum(extra_weight * loss for loss in extra_losses)
+                    self.primary_loss = primary_loss
+                    # self.last_loss = primary_loss + sum(extra_losses)
+                    # self.primary_loss = primary_loss
+                else:
+                    self.last_loss = primary_loss
+                    self.primary_loss = primary_loss
+            else:
+                self.last_loss = primary_loss
+                self.primary_loss = primary_loss
+            # else:
+            #     # inference-time mini-optimization: only forward the output on the very last position
+            #     logits = self.output(h[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            #     self.last_loss = None
 
         return logits
 
