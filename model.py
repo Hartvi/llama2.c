@@ -9,6 +9,21 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from enum import Enum
+
+
+def loss_weighting(l: int, k: int = 2)->list[float]:
+    l_sum = sum(1.0/k**i for i in range(l))
+    return [1.0 / k**i / l_sum for i in range(l)]
+
+class TrainMethod(Enum):
+    basic = 0
+    lm_heads = 1
+    transformer_heads = 2
+    causal_heads = 3
+    autoregressive_head = 4
+
+
 @dataclass
 class ModelArgs:
     # default hyperparameters for the Llama 7B model
@@ -22,6 +37,9 @@ class ModelArgs:
     norm_eps: float = 1e-5
     max_seq_len: int = 2048
     dropout: float = 0.0
+    # extra args for mtp
+    n_outputs: int = 3
+    train_method: TrainMethod = TrainMethod.basic
 
 
 class RMSNorm(torch.nn.Module):
@@ -341,3 +359,331 @@ class Transformer(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+
+class LMHeads(Transformer):
+    primary_loss: Optional[torch.Tensor] = None
+
+    def __init__(self, params: ModelArgs):
+        super().__init__(params=params)
+        self.n_outputs= params.n_outputs
+        self.extra_outputs = nn.ModuleList([nn.Linear(params.dim, params.vocab_size, bias=False) for _ in range(self.n_outputs - 1)])
+        # init all weights
+        self.apply(self._init_weights)
+        # apply special scaled init to the residual projections, per GPT-2 paper
+        for pn, p in self.named_parameters():
+            if pn.endswith('w3.weight') or pn.endswith('wo.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * params.n_layers))
+
+    def forward(self, tokens: torch.Tensor, targets: Optional[torch.Tensor] = None) -> torch.Tensor:
+        _bsz, seqlen = tokens.shape
+        seqlen = tokens.size(1) - self.n_outputs + 1
+        tokens = tokens[:, :seqlen]
+        h = self.tok_embeddings(tokens)
+        h = self.dropout(h)
+        freqs_cos = self.freqs_cos[:seqlen]
+        freqs_sin = self.freqs_sin[:seqlen]
+
+        for layer in self.layers:
+            h = layer(h, freqs_cos, freqs_sin)
+        h = self.norm(h)
+        # batch size, seq len, hidden size
+
+        """
+        Let's assume that it is reasonable to say that relevance of tokens decays exponentially.
+        In that case we would like to weight output tokens with an exponential reward function,
+        meaning the first token has `k` times higher relevance than the second predicted token.
+        For simplicity's sake let's set `k=2`. Taking into account numerical considerations where
+        floating point numbers are most precise around the value one, we shall keep the total weighting
+        of loss value to one. \sum^n_{i=0}w_i^i L_i(x) where L_{i}(x) is the loss for the i-th predicted token
+        and w_i is the weight given to the corresponding loss. Given our rule above that the next token
+        has half the weight of the previous token. This means that the weight w_i = 1/k^i.
+        All losses are thus in total magnified by \sum^n_{i=0} 1/k^i.
+        The final weighting vector of losses is [1/k / \sum^n_{i=0} 1/k^i, ..., 1/k^n / \sum^n_{i=0} 1/k^i]
+        """
+        if targets is not None:
+            # If we are given some desired targets also calculate the loss
+            logits = self.output(h)
+            primary_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets[:, :seqlen].reshape(-1), ignore_index=-1)
+
+            # Calculate losses for extra outputs if we have multiple targets
+            if self.n_outputs > 1 and targets.size(1) > 1:  # seq_len = 512
+                extra_logits = [extra_output(h) for extra_output in self.extra_outputs]
+                extra_losses = []
+
+                for i, extra_logit in enumerate(extra_logits):
+                    if seqlen + i + 1 <= targets.size(1):  # Check if we have a target for this output
+                        loss = F.cross_entropy(
+                            extra_logit.view(-1, extra_logit.size(-1)),
+                            targets[:, i + 1 : seqlen + i + 1].reshape(-1),
+                            ignore_index=-1
+                        )
+                        extra_losses.append(loss)
+
+                if extra_losses:
+                    # extra_weight = 0.5 / len(extra_losses) if extra_losses else 0
+                    # self.last_loss = 0.5 * primary_loss + sum(extra_weight * loss for loss in extra_losses)
+                    all_losses = [primary_loss, *extra_losses]
+                    loss_weights = loss_weighting(len(all_losses))
+                    self.last_loss = sum(w*l for w,l in zip(loss_weights, all_losses))
+                    # self.last_loss = sum(all_losses) / len(all_losses)
+                    self.primary_loss = primary_loss
+                else:
+                    self.last_loss = primary_loss
+                    self.primary_loss = primary_loss
+            else:
+                self.last_loss = primary_loss
+                self.primary_loss = primary_loss
+        else:
+            # inference-time mini-optimization: only forward the output on the very last position
+            logits = self.output(h[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            self.last_loss = None
+
+        return logits
+
+class TransformerHeads(Transformer):
+    primary_loss: Optional[torch.Tensor] = None
+
+    def __init__(self, params: ModelArgs):
+        super().__init__(params=params)
+        self.n_outputs= params.n_outputs
+        self.extra_layers = nn.ModuleList([
+            TransformerBlock(layer_id, params)
+            for layer_id in
+            range(params.n_layers, params.n_layers + self.n_outputs, 1)
+        ])
+        self.primary_loss: Optional[torch.Tensor] = None
+        self.last_loss: Optional[torch.Tensor] = None
+        # init all weights
+        self.apply(self._init_weights)
+        # apply special scaled init to the residual projections, per GPT-2 paper
+        for pn, p in self.named_parameters():
+            if pn.endswith('w3.weight') or pn.endswith('wo.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * params.n_layers))
+
+    def forward(self, tokens: torch.Tensor, targets: Optional[torch.Tensor] = None) -> torch.Tensor:
+        _bsz, seqlen = tokens.shape
+        seqlen = tokens.size(1) - self.n_outputs + 1
+        tokens = tokens[:, :seqlen]
+        h = self.tok_embeddings(tokens)
+        h = self.dropout(h)
+        freqs_cos = self.freqs_cos[:seqlen]
+        freqs_sin = self.freqs_sin[:seqlen]
+
+        for i in range(len(self.layers) - 1):
+            h = self.layers[i](h, freqs_cos, freqs_sin)
+        # reuse this for next tokens
+        second_to_last_h = h
+        last_layer = self.layers[-1]
+        h = self.norm(last_layer(h, freqs_cos, freqs_sin))
+        # extra transformer layers for beyond next token
+        h_extras = [
+            self.norm(self.extra_layers[i](second_to_last_h, freqs_cos, freqs_sin))
+            for i in range(len(self.extra_layers))
+        ]
+        # batch size, seq len, hidden size
+
+        if targets is not None:
+            # If we are given some desired targets also calculate the loss
+            logits = self.output(h)
+            primary_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets[:, :seqlen].reshape(-1), ignore_index=-1)
+
+            # Calculate losses for extra outputs if we have multiple targets
+            if self.n_outputs > 1 and targets.size(1) > 1:  # seqlen = 512 by default
+                extra_logits = [self.output(h_extra) for h_extra in h_extras]
+                extra_losses: list[torch.Tensor] = []
+
+                for i, extra_logit in enumerate(extra_logits):
+                    if seqlen + i + 1 <= targets.size(1):  # Check if we have a target for this output
+                        loss = F.cross_entropy(
+                            extra_logit.view(-1, extra_logit.size(-1)),
+                            targets[:, i + 1 : seqlen + i + 1].reshape(-1),
+                            ignore_index=-1
+                        )
+                        extra_losses.append(loss)
+
+                if extra_losses:
+                    all_losses = [primary_loss, *extra_losses]
+                    loss_weights = loss_weighting(len(all_losses))
+                    self.last_loss = sum(w*l for w,l in zip(loss_weights, all_losses))
+                    # self.last_loss = sum(all_losses) / len(all_losses)
+                    self.primary_loss = primary_loss
+                else:
+                    self.last_loss = primary_loss
+                    self.primary_loss = primary_loss
+            else:
+                self.last_loss = primary_loss
+                self.primary_loss = primary_loss
+        else:
+            # inference-time mini-optimization: only forward the output on the very last position
+            logits = self.output(h[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            self.last_loss = None
+
+        return logits
+
+class CausalTransformerHeads(Transformer):
+    primary_loss: Optional[torch.Tensor] = None
+
+    def __init__(self, params: ModelArgs):
+        super().__init__(params=params)
+        self.n_outputs= params.n_outputs
+        self.extra_layers = nn.ModuleList([
+            TransformerBlock(layer_id, params)
+            for layer_id in
+            range(params.n_layers, params.n_layers + self.n_outputs, 1)
+        ])
+        self.primary_loss: Optional[torch.Tensor] = None
+        self.last_loss: Optional[torch.Tensor] = None
+        # init all weights
+        self.apply(self._init_weights)
+        # apply special scaled init to the residual projections, per GPT-2 paper
+        for pn, p in self.named_parameters():
+            if pn.endswith('w3.weight') or pn.endswith('wo.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * params.n_layers))
+
+    def forward(self, tokens: torch.Tensor, targets: Optional[torch.Tensor] = None) -> torch.Tensor:
+        _bsz, seqlen = tokens.shape
+        seqlen = tokens.size(1) - self.n_outputs + 1
+        tokens = tokens[:, :seqlen]
+        h = self.tok_embeddings(tokens)
+        h = self.dropout(h)
+        freqs_cos = self.freqs_cos[:seqlen]
+        freqs_sin = self.freqs_sin[:seqlen]
+
+        for i in range(len(self.layers)):
+            h = self.layers[i](h, freqs_cos, freqs_sin)
+        # extra transformer layers for beyond next token
+        h_extras = []
+        tmp_h = h
+        for i in range(len(self.extra_layers)):
+            tmp_h = self.extra_layers[i](tmp_h, freqs_cos, freqs_sin)
+            h_extras.append(tmp_h)
+        h = self.norm(h)
+        h_extras = [self.norm(h_extra) for h_extra in h_extras]
+        # batch size, seq len, hidden size
+
+        if targets is not None:
+            # If we are given some desired targets also calculate the loss
+            logits = self.output(h)
+            primary_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets[:, :seqlen].reshape(-1), ignore_index=-1)
+
+            # Calculate losses for extra outputs if we have multiple targets
+            if self.n_outputs > 1 and targets.size(1) > 1:  # seqlen = 512 by default
+                extra_logits = [self.output(h_extra) for h_extra in h_extras]
+                extra_losses: list[torch.Tensor] = []
+
+                for i, extra_logit in enumerate(extra_logits):
+                    if seqlen + i + 1 <= targets.size(1):  # Check if we have a target for this output
+                        loss = F.cross_entropy(
+                            extra_logit.view(-1, extra_logit.size(-1)),
+                            targets[:, i + 1 : seqlen + i + 1].reshape(-1),
+                            ignore_index=-1
+                        )
+                        extra_losses.append(loss)
+
+                if extra_losses:
+                    all_losses = [primary_loss, *extra_losses]
+                    loss_weights = loss_weighting(len(all_losses))
+                    self.last_loss = sum(w*l for w,l in zip(loss_weights, all_losses))
+                    # extra_weight = 0.5 / len(extra_losses) if extra_losses else 0
+                    # self.last_loss = 0.5 * primary_loss + sum(extra_weight * loss for loss in extra_losses)
+                    # self.last_loss = sum(all_losses) / len(all_losses)
+                    self.primary_loss = primary_loss
+                else:
+                    self.last_loss = primary_loss
+                    self.primary_loss = primary_loss
+            else:
+                self.last_loss = primary_loss
+                self.primary_loss = primary_loss
+        else:
+            # inference-time mini-optimization: only forward the output on the very last position
+            logits = self.output(h[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            self.last_loss = None
+
+        return logits
+
+
+class AutoRegressiveHead(Transformer):
+    primary_loss: Optional[torch.Tensor] = None
+
+    def __init__(self, params: ModelArgs):
+        super().__init__(params=params)
+        self.n_outputs= params.n_outputs
+        self.primary_loss: Optional[torch.Tensor] = None
+        self.last_loss: Optional[torch.Tensor] = None
+
+    def forward(self, tokens: torch.Tensor, targets: Optional[torch.Tensor] = None) -> torch.Tensor:
+        _bsz, seqlen = tokens.shape
+        seqlen = tokens.size(1) - self.n_outputs + 1
+        tokens = tokens[:, :seqlen]
+        h = self.tok_embeddings(tokens)
+        h = self.dropout(h)
+        freqs_cos = self.freqs_cos[:seqlen]
+        freqs_sin = self.freqs_sin[:seqlen]
+
+        for i in range(len(self.layers)):
+            h = self.layers[i](h, freqs_cos, freqs_sin)
+        # extra transformer layers for beyond next token
+        h_extras = []
+        tmp_h = h
+        for i in range(self.n_outputs-1):
+            tmp_h = self.layers[-1](tmp_h, freqs_cos, freqs_sin)
+            h_extras.append(tmp_h)
+        h = self.norm(h)
+        h_extras = [self.norm(h_extra) for h_extra in h_extras]
+        # batch size, seq len, hidden size
+
+        if targets is not None:
+            # If we are given some desired targets also calculate the loss
+            logits = self.output(h)
+            primary_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets[:, :seqlen].reshape(-1), ignore_index=-1)
+
+            # Calculate losses for extra outputs if we have multiple targets
+            if self.n_outputs > 1 and targets.size(1) > 1:  # seqlen = 512 by default
+                extra_logits = [self.output(h_extra) for h_extra in h_extras]
+                extra_losses: list[torch.Tensor] = []
+
+                for i, extra_logit in enumerate(extra_logits):
+                    if seqlen + i + 1 <= targets.size(1):  # Check if we have a target for this output
+                        loss = F.cross_entropy(
+                            extra_logit.view(-1, extra_logit.size(-1)),
+                            targets[:, i + 1 : seqlen + i + 1].reshape(-1),
+                            ignore_index=-1
+                        )
+                        extra_losses.append(loss)
+
+                if extra_losses:
+                    all_losses = [primary_loss, *extra_losses]
+                    loss_weights = loss_weighting(len(all_losses))
+                    self.last_loss = sum(w*l for w,l in zip(loss_weights, all_losses))
+                    # extra_weight = 0.5 / len(extra_losses) if extra_losses else 0
+                    # self.last_loss = 0.5 * primary_loss + sum(extra_weight * loss for loss in extra_losses)
+                    # self.last_loss = sum(all_losses) / len(all_losses)
+                    self.primary_loss = primary_loss
+                else:
+                    self.last_loss = primary_loss
+                    self.primary_loss = primary_loss
+            else:
+                self.last_loss = primary_loss
+                self.primary_loss = primary_loss
+        else:
+            # inference-time mini-optimization: only forward the output on the very last position
+            logits = self.output(h[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            self.last_loss = None
+
+        return logits
+
+
+def get_transformer_cls(model_args: ModelArgs):
+    tm = TrainMethod(model_args.train_method)
+    if tm == TrainMethod.basic:
+        return Transformer
+    if tm == TrainMethod.lm_heads:
+        return LMHeads
+    if tm == TrainMethod.transformer_heads:
+        return TransformerHeads
+    if tm == TrainMethod.causal_heads:
+        return CausalTransformerHeads
+    if tm == TrainMethod.autoregressive_head:
+        return AutoRegressiveHead
+    assert False

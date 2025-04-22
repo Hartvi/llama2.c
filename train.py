@@ -24,7 +24,7 @@ from datetime import datetime
 from functools import partial
 
 import torch
-from model import Transformer, ModelArgs
+from model import Transformer, ModelArgs, get_transformer_cls, TrainMethod
 from torch.distributed import destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -41,7 +41,7 @@ eval_only = False  # if True, script exits right after the first eval
 always_save_checkpoint = False  # if True, always save a checkpoint after each eval
 init_from = "scratch"  # 'scratch' or 'resume'
 # wandb logging
-wandb_log = False  # disabled by default
+wandb_log = True  # disabled by default
 wandb_project = "llamac"
 wandb_run_name = "run" + datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
 # data
@@ -58,6 +58,7 @@ multiple_of = 32
 dropout = 0.0
 # adamw optimizer
 gradient_accumulation_steps = 4  # used to simulate larger batch sizes
+# TODO: small model larger LR
 learning_rate = 5e-4  # max learning rate
 max_iters = 100000  # total number of training iterations
 weight_decay = 1e-1
@@ -68,8 +69,10 @@ grad_clip = 1.0  # clip gradients at this value, or disable if == 0.0
 decay_lr = True  # whether to decay the learning rate
 warmup_iters = 1000  # how many steps to warm up for
 # system
-device = "cuda"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+device = "cpu"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = "bfloat16"  # float32|bfloat16|float16
+n_outputs = 3
+train_method = 1
 compile = True  # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [
@@ -79,6 +82,7 @@ config_keys = [
 ]
 exec(open("configurator.py").read())  # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys}  # will be useful for logging
+print(config)
 # -----------------------------------------------------------------------------
 
 # fixing some hyperparams to sensible defaults
@@ -153,12 +157,15 @@ model_args = dict(
     multiple_of=multiple_of,
     max_seq_len=max_seq_len,
     dropout=dropout,
+    n_outputs=n_outputs,
+    train_method=train_method,
 )  # start with model_args from command line
+print("INIT:", init_from)
 if init_from == "scratch":
     # init a new model from scratch
     print("Initializing a new model from scratch")
     gptconf = ModelArgs(**model_args)
-    model = Transformer(gptconf)
+    model = get_transformer_cls(gptconf)(gptconf)
 elif init_from == "resume":
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
@@ -171,7 +178,7 @@ elif init_from == "resume":
         model_args[k] = checkpoint_model_args[k]
     # create the model
     gptconf = ModelArgs(**model_args)
-    model = Transformer(gptconf)
+    model = get_transformer_cls(gptconf)(gptconf)
     state_dict = checkpoint["model"]
     # fix the keys of the state dictionary :(
     # honestly no idea how checkpoints sometimes get this prefix, have to debug more
@@ -183,6 +190,9 @@ elif init_from == "resume":
     iter_num = checkpoint["iter_num"]
     best_val_loss = checkpoint["best_val_loss"]
 model.to(device)
+assert model
+
+print("===", "TRAINING:", TrainMethod(model_args["train_method"]), "===")
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
@@ -219,7 +229,8 @@ def estimate_loss():
             X, Y = next(batch_iter)
             with ctx:
                 logits = model(X, Y)
-                loss = raw_model.last_loss
+                # get primary, otherwise the original last_loss
+                loss = getattr(raw_model, "primary_loss", getattr(raw_model, "last_loss"))
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -242,12 +253,14 @@ def get_lr(it):
 # logging
 if wandb_log and master_process:
     import wandb
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+    # wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+    iter_run = wandb.init(project=wandb_project, name=wandb_run_name+"_iter_"+str(TrainMethod(model_args["train_method"])))
 
 # training loop
 train_batch_iter = iter_batches(split="train")
 X, Y = next(train_batch_iter)  # fetch the very first batch
 t0 = time.time()
+START_TIME = time.time()
 local_iter_num = 0  # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model  # unwrap DDP container if needed
 running_mfu = -1.0
@@ -263,7 +276,8 @@ while True:
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
             try:
-                wandb.log(
+                print("Logging iter", iter_num, " and time:", int(time.time() - START_TIME))
+                iter_run.log(
                     {
                         "iter": iter_num,
                         "tokens": iter_num * tokens_per_iter,
@@ -271,7 +285,10 @@ while True:
                         "loss/val": losses["val"],
                         "lr": lr,
                         "mfu": running_mfu * 100,  # convert to percentage
-                    }, step = iter_num
+                        # "time": int(time.time() - START_TIME),
+                    # we can change the axis to iter in wandb
+                    }, step = int(time.time() - START_TIME),
+                    # }, step = iter_num,
                 )
             except Exception as e:
                 print(f"logging to wandb failed: {e}")
@@ -337,6 +354,9 @@ while True:
 
     # termination conditions
     if iter_num > max_iters:
+        break
+    # max 7 minutes
+    if time.time() - START_TIME > 5*60:
         break
 
 if ddp:
